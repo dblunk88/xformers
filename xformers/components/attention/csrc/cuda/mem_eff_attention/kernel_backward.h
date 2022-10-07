@@ -44,7 +44,59 @@
 
 using namespace gemm_kernel_utils;
 
+
+
 namespace {
+
+template <typename FragmentType, int32_t kNumThreads>
+struct GmemTile {
+  // 128bits per thread
+  using AccessType = cutlass::Array<float, 4>;
+  static constexpr int32_t kBytes = sizeof(AccessType);
+  static constexpr int32_t kStride = kNumThreads * AccessType::kElements;
+  static constexpr int32_t kNumIters = FragmentType::kElements / AccessType::kElements;
+  static constexpr int32_t kElementsStored = kNumThreads * FragmentType::kElements;
+  static_assert(FragmentType::kElements % AccessType::kElements == 0, "fragment not aligned on 128 bits");
+
+  float* __restrict__ ptr;
+
+  CUTLASS_DEVICE void prefetch(int thread_id) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kNumIters; ++i) {
+      AccessType* __restrict__ gmem_ptr = reinterpret_cast<AccessType*>(ptr + thread_id * AccessType::kElements + i * kStride);
+      uint64_t addr = (uint64_t)((void*)gmem_ptr);
+      asm volatile("prefetch.global.L1 [ %1 ];" : "=l"(addr) : "l"(addr));
+    }
+  }
+
+  CUTLASS_DEVICE void load(FragmentType& fragment, int thread_id) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kNumIters; ++i) {
+      AccessType* __restrict__ gmem_ptr = reinterpret_cast<AccessType*>(ptr + thread_id * AccessType::kElements + i * kStride);
+      AccessType sub_fragment;
+      cutlass::arch::global_load<AccessType, kBytes>(sub_fragment, gmem_ptr, true);
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < AccessType::kElements; ++j) {
+        fragment[i * AccessType::kElements + j] = sub_fragment[j];
+      }
+    }
+  }
+
+  CUTLASS_DEVICE void store(FragmentType const& fragment, int thread_id) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kNumIters; ++i) {
+      AccessType* __restrict__ gmem_ptr = reinterpret_cast<AccessType*>(ptr + thread_id * AccessType::kElements + i * kStride);
+      AccessType sub_fragment;
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < AccessType::kElements; ++j) {
+        sub_fragment[j] = fragment[i * AccessType::kElements + j];
+      }
+      cutlass::arch::global_store<AccessType, kBytes>(sub_fragment, gmem_ptr, true);
+    }
+  }
+};
+
+
 template <typename scalar_t, typename Arch>
 constexpr int getWarpsPerSm() {
   bool is_half = !std::is_same<scalar_t, float>::value;
@@ -67,6 +119,7 @@ template <
 struct AttentionBackwardKernel {
   using scalar_t = scalar_t_;
   using output_t = scalar_t;
+  using output_accum_t = float;
   using lse_scalar_t = float;
   using accum_t = float;
   using ArchTag = ArchTag_;
@@ -86,6 +139,9 @@ struct AttentionBackwardKernel {
     output_t* grad_query_ptr; //  [Mq, nH, K]
     output_t* grad_key_ptr; //    [Mk, nH, K]
     output_t* grad_value_ptr; //  [Mk, nH, Kv]
+    // Accumulators
+    output_accum_t* gmem_storage = nullptr; // [nH, Mq, K]
+    output_accum_t* gmem_storage_end = nullptr; // [nH, Mq, K]
 
     // Dimensions/strides
     int32_t head_dim;
@@ -139,7 +195,7 @@ struct AttentionBackwardKernel {
       constexpr int32_t kAlignLSE = 32; // block size of backward
       auto lse_dim = ceil_div((int32_t)num_queries, kAlignLSE) * kAlignLSE;
 
-      int32_t batch_id = blockIdx.z;
+      int64_t batch_id = blockIdx.z;
       int32_t head_id = blockIdx.y;
 
       query_ptr += batch_id * q_strideB + head_id * q_strideH;
@@ -177,6 +233,19 @@ struct AttentionBackwardKernel {
       grad_query_ptr = warp_uniform(grad_query_ptr);
       grad_key_ptr = warp_uniform(grad_key_ptr);
       grad_value_ptr = warp_uniform(grad_value_ptr);
+
+      if (kNeedsAccumGradQ || kNeedsAccumGradK || kNeedsAccumGradV) {
+        assert(gmem_storage != nullptr);
+        // format: [B, H, M, K]
+        int32_t strideM = align_up(head_dim, (int32_t)kBlockSizeJ);
+        int32_t strideH = strideM * align_up(num_queries, (int32_t)kBlockSizeI);
+        int32_t strideB = strideH * num_heads;
+        gmem_storage += batch_id * strideB + head_id * strideH;
+        gmem_storage_end = gmem_storage + strideH;
+        gmem_storage = warp_uniform(gmem_storage);
+      } else {
+        gmem_storage = nullptr;
+      }
     }
 
     __host__ dim3 getBlocksGrid() const {
@@ -184,6 +253,20 @@ struct AttentionBackwardKernel {
     }
     __host__ dim3 getThreadsGrid() const {
       return dim3(kWarpSize, kNumWarpsPerBlock, 1);
+    }
+    __host__ size_t gmem_f32_elements() const {
+      // Returns number of f32 elements we need as buffer in gmem
+      size_t elements = 0;
+      if (kNeedsAccumGradQ) {
+        elements += num_batches * num_heads * align_up(num_queries, (int32_t)kBlockSizeI) * align_up(head_dim, (int32_t)kBlockSizeJ);
+      }
+      if (kNeedsAccumGradK) {
+        elements += num_batches * num_keys * num_heads * head_dim;
+      }
+      if (kNeedsAccumGradV) {
+        elements += num_batches * num_keys * num_heads * head_dim_value;
+      }
+      return elements;
     }
   };
 
@@ -220,6 +303,13 @@ struct AttentionBackwardKernel {
   // (B, Mq, Mkv, K) = (1, 1, 1, 136) for instance
   static constexpr bool kKernelComputesDelta =
       kIsHalf && (kOutputInRF || ArchTag::kMinComputeCapability != 70);
+
+  static constexpr bool kNeedsAccumGradQ =
+      !std::is_same<output_accum_t, output_t>::value;
+  static constexpr bool kNeedsAccumGradK =
+      !kOutputInRF && !std::is_same<output_accum_t, output_t>::value;
+  static constexpr bool kNeedsAccumGradV =
+      !kOutputInRF && !std::is_same<output_accum_t, output_t>::value;
 
   // Launch bounds
   static constexpr int64_t kNumThreads = kWarpSize * kNumWarpsPerBlock;
@@ -420,6 +510,7 @@ struct AttentionBackwardKernel {
     using OutputTileIterator =
         typename cutlass::epilogue::threadblock::MakePrefetchableIterator<
             typename DefaultEpilogue::OutputTileIterator>::Iterator;
+    using AccumTileIterator = GmemTile<typename Mma::FragmentC, kNumThreads>;
   };
   struct MatmulGradK {
     // grad_k <- tmp.transpose(-2, -1) @ q_i
@@ -695,9 +786,9 @@ struct AttentionBackwardKernel {
     extern __shared__ char smem_buffer[];
     SharedStorage& shared_storage = *((SharedStorage*)smem_buffer);
 
-    auto getQueryStart = [&](int32_t key_start) {
+    auto getQueryStart = [&](int32_t key_start) -> int32_t {
       if (p.causal) {
-        return key_start;
+        return (key_start / kBlockSizeI) * kBlockSizeI;
       }
       return 0;
     };
@@ -1116,18 +1207,12 @@ struct AttentionBackwardKernel {
     for (int col = 0; col < p.head_dim;
          col += MatmulGradQ::ThreadblockShape::kN) {
       using Mma = typename MatmulGradQ::Mma;
+      using AccumTileIterator = typename MatmulGradQ::AccumTileIterator;
 
       cutlass::gemm::GemmCoord problem_size(
           num_queries_in_block,
           false ? MatmulGradQ::ThreadblockShape::kN : p.head_dim - col,
           num_keys_in_block);
-      auto createEpilogueIter = [&]() {
-        return typename MatmulGradQ::OutputTileIterator(
-            typename MatmulGradQ::OutputTileIterator::Params{p.gQ_strideM()},
-            p.grad_query_ptr + query_start * p.gQ_strideM() + col,
-            {problem_size.m(), problem_size.n()},
-            thread_id);
-      };
 
       // k_j
       typename Mma::IteratorB iterator_B(
@@ -1147,13 +1232,23 @@ struct AttentionBackwardKernel {
 
       typename Mma::FragmentC accum;
 
-      accum.clear();
+      bool isFirst = key_start == 0;
+      float* __restrict__ gmem_accum_ptr = p.gmem_storage;
+      gmem_accum_ptr += (query_start / kBlockSizeI) * ceil_div(p.head_dim, (int32_t)kBlockSizeJ) * AccumTileIterator::kElementsStored;
+      gmem_accum_ptr += (col / MatmulGradQ::ThreadblockShape::kN) * AccumTileIterator::kElementsStored;
+      assert(gmem_accum_ptr < p.gmem_storage_end);
+      if (isFirst) {
+        accum.clear();
+      } else {
+        AccumTileIterator gmem_tile;
+        gmem_tile.ptr = gmem_accum_ptr;
+        gmem_tile.load(accum, thread_id);
+        PRINT_T0_L0("k=%d/q=%d/col=%d LD %f %f", int(key_start), int(query_start), int(col), float(accum[0]), float(accum[1]));
+      }
 
       auto gemm_k_iterations =
           (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
 
-      // Start prefetching output tile now to make the epilogue faster
-      createEpilogueIter().prefetch_all();
       // Compute threadblock-scoped matrix multiply-add
       __syncthreads();
       mma.set_prologue_done(kPrologueGQ);
@@ -1165,44 +1260,28 @@ struct AttentionBackwardKernel {
       }
 
       // Output results
-      typename MatmulGradQ::OutputTileIterator output_it = createEpilogueIter();
-      DISPATCH_BOOL(
-          key_start == 0, kIsFirst, ([&]() {
-            using DefaultEpilogue = typename MatmulGradQ::DefaultEpilogue;
-            using DefaultOutputOp = typename MatmulGradQ::DefaultOutputOp;
-            static constexpr auto ScaleType = kIsFirst
-                ? cutlass::epilogue::thread::ScaleType::Nothing
-                : cutlass::epilogue::thread::ScaleType::NoBetaScaling;
-            using EpilogueOutputOp =
-                typename cutlass::epilogue::thread::LinearCombination<
-                    typename DefaultOutputOp::ElementOutput,
-                    DefaultOutputOp::kCount,
-                    typename DefaultOutputOp::ElementAccumulator,
-                    typename DefaultOutputOp::ElementCompute,
-                    ScaleType>;
-            using Epilogue =
-                typename cutlass::epilogue::threadblock::EpiloguePipelined<
-                    typename DefaultEpilogue::Shape,
-                    typename Mma::Operator,
-                    DefaultEpilogue::kPartitionsK,
-                    typename MatmulGradQ::OutputTileIterator,
-                    typename DefaultEpilogue::AccumulatorFragmentIterator,
-                    typename DefaultEpilogue::WarpTileIterator,
-                    typename DefaultEpilogue::SharedLoadIterator,
-                    EpilogueOutputOp,
-                    typename DefaultEpilogue::Padding,
-                    DefaultEpilogue::kFragmentsPerIteration,
-                    true // IterationsUnroll
-                    >;
-            EpilogueOutputOp rescale({1, 1});
-            Epilogue epilogue(
-                isLastColumn ? shared_storage.gradQ_epilogue_lastIter()
-                             : shared_storage.gradQ_epilogue(),
-                thread_id,
-                warp_id,
-                lane_id);
-            epilogue(rescale, output_it, accum, output_it);
-          }));
+      int32_t next_query, next_key;
+      incrIteration(p, p.num_queries, key_start, next_query, next_key);
+      bool isLast =
+          (p.causal && next_query > query_start) || next_key >= p.num_keys;
+      if (!isLast) {
+        AccumTileIterator gmem_tile;
+        gmem_tile.ptr = gmem_accum_ptr;
+        PRINT_T0_L0("k=%d/q=%d/col=%d ST %f %f", int(key_start), int(query_start), int(col), float(accum[0]), float(accum[1]));
+        gmem_tile.store(accum, thread_id);
+      } else {
+        typename MatmulGradQ::OutputTileIterator output_it(
+            typename MatmulGradQ::OutputTileIterator::Params{p.gQ_strideM()},
+            p.grad_query_ptr + query_start * p.gQ_strideM() + col,
+            {problem_size.m(), problem_size.n()},
+            thread_id);
+        accumulateInGmem<MatmulGradQ>(
+            isLastColumn ? shared_storage.gradQ_epilogue_lastIter()
+                        : shared_storage.gradQ_epilogue(),
+            accum,
+            output_it,
+            true);
+      }
     }
     /////////////////////////////////////////////////////////////////////////////////////////////////
     // GradK matmul
@@ -1285,6 +1364,20 @@ struct AttentionBackwardKernel {
             createEpilogueIter(),
             query_start == 0 || (p.causal && query_start == key_start));
       }
+    }
+  }
+
+  static CUTLASS_DEVICE void incrIteration(
+      Params const& p,
+      int32_t query_start,
+      int32_t key_start,
+      int32_t& next_query,
+      int32_t& next_key) {
+    next_query = query_start + kBlockSizeI;
+    next_key = key_start;
+    if (next_query >= p.num_queries) {
+      next_key = key_start + kBlockSizeJ;
+      next_query = p.causal ? (next_key / kBlockSizeI) * kBlockSizeI : 0;
     }
   }
 
@@ -1420,11 +1513,11 @@ struct AttentionBackwardKernel {
     // on windows, previous syntax __restrict__ AccessType*
     // resulted in error: "restrict" is not allowed
     const AccessType* __restrict__ grad_output_ptr =
-        reinterpret_cast<const AccessType* __restrict__>(
+        reinterpret_cast<const AccessType*>(
             p.grad_output_ptr + (query_start + laneRow) * p.gO_strideM +
             laneFirstCol);
     const AccessType* __restrict__ output_ptr =
-        reinterpret_cast<const AccessType* __restrict__>(
+        reinterpret_cast<const AccessType*>(
             p.output_ptr + (query_start + laneRow) * p.o_strideM() +
             laneFirstCol);
 
