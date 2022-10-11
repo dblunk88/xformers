@@ -11,6 +11,8 @@ from typing import Any, List, Mapping, Optional, Sequence, Set, Tuple, Type, Uni
 
 import torch
 
+from xformers.triton.flash_attention import _flash_attention as triton_flash
+
 try:
     from . import _C_flashattention  # type: ignore[attr-defined]
 
@@ -652,6 +654,51 @@ class MemoryEfficientAttentionFlashAttentionOp(AttentionOpBase):
         return dq, dk, dv, softmax_d
 
 
+class TritonFlashAttentionOp(AttentionOpBase):
+    FORWARD_OPERATOR = None
+    SUPPORTED_DEVICES = {"cuda"}
+    SUPPORTED_DTYPES = {torch.half, torch.bfloat16}
+    SUPPORTED_MAX_K: float = math.inf
+    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {type(None), LowerTriangularMask}
+    SUPPORTS_DROPOUT = False
+    NAME = "tritonflashatt"
+
+    @classmethod
+    def forward_no_grad(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_bias: Optional[Union[torch.Tensor, AttentionMask]],
+        p: float,
+    ) -> torch.Tensor:
+        softmax_scale = query.shape[-1] ** (-0.5)
+        return triton_flash.forward_no_grad(
+            ctx=None,
+            q=query,
+            k=key,
+            v=value,
+            sm_scale=softmax_scale,
+            causal=isinstance(attn_bias, LowerTriangularMask),
+        )
+
+    @classmethod
+    def forward(cls, ctx, query, key, value, attn_bias, p):
+        softmax_scale = query.shape[-1] ** (-0.5)
+        return triton_flash.forward(
+            ctx=ctx,
+            q=query,
+            k=key,
+            v=value,
+            sm_scale=softmax_scale,
+            causal=isinstance(attn_bias, LowerTriangularMask),
+        )
+
+    @staticmethod
+    def backward(ctx, grad):
+        return triton_flash.backward(ctx, grad)
+
+
 class MemoryEfficientAttentionCutlassFwdFlashBwOp(MemoryEfficientAttentionCutlassOp):
     FW_OP = MemoryEfficientAttentionCutlassOp
     BW_OP = MemoryEfficientAttentionFlashAttentionOp
@@ -684,6 +731,7 @@ class MemoryEfficientAttentionCutlassFwdFlashBwOp(MemoryEfficientAttentionCutlas
         )
 
 
+# TODO: add triton here.
 @dataclass
 class AttentionOpDispatch:
     dtype: torch.dtype
@@ -717,6 +765,7 @@ class AttentionOpDispatch:
             MemoryEfficientAttentionFlashAttentionOp,
             MemoryEfficientAttentionCutlassOp,
             MemoryEfficientAttentionOp,
+            TritonFlashAttentionOp,
         ]
         if self._is_cutlass_fwd_faster_than_flash():
             priority_list_ops.insert(0, MemoryEfficientAttentionCutlassFwdFlashBwOp)
