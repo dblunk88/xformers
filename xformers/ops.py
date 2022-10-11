@@ -11,14 +11,19 @@ from typing import Any, List, Mapping, Optional, Sequence, Set, Tuple, Type, Uni
 
 import torch
 
-from xformers.triton.flash_attention import _flash_attention as triton_flash
-
 try:
     from . import _C_flashattention  # type: ignore[attr-defined]
 
     has_flashattention = True
 except ImportError:
     has_flashattention = False
+
+try:
+    from xformers.triton.flash_attention import _flash_attention as triton_flash
+
+    has_triton_flashattention = True
+except ImportError:
+    has_triton_flashattention = False
 
 
 def masked_matmul(a, b, mask=None):
@@ -662,6 +667,18 @@ class TritonFlashAttentionOp(AttentionOpBase):
     SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {type(None), LowerTriangularMask}
     SUPPORTS_DROPOUT = False
     NAME = "tritonflashatt"
+
+    @classmethod
+    def info(cls):
+        if not has_triton_flashattention:
+            return "not built"
+        return "available"
+
+    @classmethod
+    def supports(cls, d: "AttentionOpDispatch") -> bool:
+        if not has_triton_flashattention:
+            return False
+        return super(TritonFlashAttentionOp, cls).supports(d)
 
     @classmethod
     def forward_no_grad(
