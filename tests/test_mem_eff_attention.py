@@ -79,6 +79,7 @@ def _generate_op_device_dtype_B_Mq_Mkv_H_K_Kv(**kwargs):
         xformers.ops.MemoryEfficientAttentionCutlassOp,
         xformers.ops.MemoryEfficientAttentionFlashAttentionOp,
         xformers.ops.MemoryEfficientAttentionCutlassFwdFlashBwOp,
+        xformers.ops.TritonFlashAttentionOp,
     ]:
         for shape in generate_test_shapes_B_Mq_Mkv_H_K_Kv(op, **kwargs):
             for device in _devices:
